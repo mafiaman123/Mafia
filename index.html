@@ -1,0 +1,1044 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+<title>Tribunal — Mafia Game Master</title>
+
+<!-- Fonts: condensed poster display + clean body + monospace utility for case-file numerics -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+
+<!-- Tailwind -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink:      '#0A0B0D',
+          panel:    '#14161B',
+          panel2:   '#1B1E25',
+          hairline: '#2A2E37',
+          gold:     '#C9A227',
+          goldDim:  '#8A6F1E',
+          mafia:    '#C0392B',
+          mafiaDim: '#3A1512',
+          town:     '#3E9B6F',
+          townDim:  '#123324',
+          neutral:  '#8E5FD1',
+          neutralDim:'#2A1C3E',
+          paper:    '#E9E4D8',
+        },
+        fontFamily: {
+          display: ['Oswald', 'sans-serif'],
+          body: ['Inter', 'sans-serif'],
+          mono: ['JetBrains Mono', 'monospace'],
+        },
+      }
+    }
+  }
+</script>
+
+<!-- PeerJS for online co-op -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+<style>
+  html, body { background:#0A0B0D; }
+  * { -webkit-tap-highlight-color: transparent; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background:#2A2E37; border-radius:4px; }
+  .font-display { letter-spacing: 0.02em; }
+  .case-stamp {
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0.15em;
+  }
+  .tab-fold {
+    clip-path: polygon(0 0, 100% 0, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  }
+  .seal {
+    background: radial-gradient(circle at 35% 30%, rgba(255,255,255,0.15), transparent 60%);
+  }
+  .btn-press:active { transform: scale(0.97); }
+  .view { animation: fadeIn .25s ease; }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(6px);} to {opacity:1; transform:none;} }
+  input[type="range"] { accent-color: #C9A227; }
+  input[type="checkbox"] { accent-color: #C9A227; }
+  .scrollbar-none::-webkit-scrollbar{ display:none; }
+  .scrollbar-none { -ms-overflow-style:none; scrollbar-width:none; }
+  @media (prefers-reduced-motion: reduce) {
+    .view { animation: none; }
+  }
+</style>
+</head>
+
+<body class="bg-ink text-paper font-body min-h-screen overflow-x-hidden">
+
+<div id="app" class="min-h-screen flex flex-col max-w-2xl mx-auto relative"></div>
+
+<!-- Generic modal root -->
+<div id="modalRoot"></div>
+
+<script>
+/* =========================================================================
+   TRIBUNAL — Mafia Game Master Assistant
+   Single-file vanilla JS app. State machine driven by `state.view`.
+   ========================================================================= */
+
+/* ---------------------------- State & Storage ---------------------------- */
+
+const STORAGE_KEY = 'tribunal_state_v1';
+
+const DEFAULT_ROLES = [
+  { id:'villager', name:'Villager', alignment:'town', wakeOrder:0, minCount:0, weight:10, isPair:false,
+    description:'No special ability. Use the day phase to observe, debate and vote out threats.' },
+  { id:'mafia', name:'Mafia', alignment:'mafia', wakeOrder:3, minCount:1, weight:5, isPair:false,
+    description:'Wakes each night with fellow Mafia to choose one player to eliminate.' },
+  { id:'doctor', name:'Doctor', alignment:'town', wakeOrder:2, minCount:1, weight:3, isPair:false,
+    description:'Wakes each night to protect one player from elimination.' },
+  { id:'sheriff', name:'Sheriff', alignment:'town', wakeOrder:1, minCount:1, weight:3, isPair:false,
+    description:'Wakes each night to investigate one player and learn their alignment.' },
+  { id:'jester', name:'Jester', alignment:'neutral', wakeOrder:0, minCount:0, weight:1, isPair:false,
+    description:'Wins alone if voted out by the town during a day phase.' },
+  { id:'lovers', name:'Lovers', alignment:'neutral', wakeOrder:0, minCount:0, weight:2, isPair:true,
+    description:'Two secretly bound players. If one dies, the other dies of grief.' },
+];
+
+const PRESETS = {
+  '5-classic': { label:'5 Players — Classic', players:5, minCounts:{ mafia:1, sheriff:1, doctor:1 } },
+  '8-advanced': { label:'8 Players — Advanced', players:8, minCounts:{ mafia:2, sheriff:1, doctor:1, jester:1, lovers:2 } },
+  '12-large': { label:'12 Players — Large Table', players:12, minCounts:{ mafia:3, sheriff:1, doctor:1, jester:1, lovers:2 } },
+};
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      parsed.roles = parsed.roles && parsed.roles.length ? parsed.roles : structuredClone(DEFAULT_ROLES);
+      return parsed;
+    }
+  } catch(e) { console.warn('state load failed', e); }
+  return {
+    roles: structuredClone(DEFAULT_ROLES),
+    settings: { teammateAwareness:true, gmPassword:'1234', shuffleTurnOrder:true },
+    stats: { gamesPlayed:0, lastPlayerCount:0 },
+  };
+}
+function saveState() { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+
+let state = loadState();
+
+/* Runtime (non-persisted) game session */
+let session = {
+  view: 'menu',
+  players: [],        // [{name, roleId, alive:true, notes:''}]
+  passIndex: 0,
+  passRevealed: false,
+  timer: { seconds: 300, remaining: 300, running:false, intervalId:null },
+  peer: null, hostConn: {}, clientConn: null, roomCode: null, isHost:false,
+  onlinePlayers: [], // {name, conn}
+  gmUnlocked: false,
+};
+
+/* ------------------------------ Utilities -------------------------------- */
+
+function el(html) {
+  const t = document.createElement('template');
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild;
+}
+function $(sel, root=document) { return root.querySelector(sel); }
+function shuffleArr(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function alignColor(alignment) {
+  return { mafia:'mafia', town:'town', neutral:'neutral' }[alignment] || 'gold';
+}
+function alignLabel(alignment) {
+  return { mafia:'MAFIA', town:'TOWN', neutral:'NEUTRAL' }[alignment] || alignment.toUpperCase();
+}
+function roleById(id) { return state.roles.find(r => r.id === id); }
+function genRoomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  for (let i=0;i<4;i++) code += chars[Math.floor(Math.random()*chars.length)];
+  return code;
+}
+
+function showModal(contentHTML, opts={}) {
+  const root = $('#modalRoot');
+  root.innerHTML = '';
+  const overlay = el(`
+    <div class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div class="bg-panel border border-hairline rounded-2xl max-w-sm w-full p-6 shadow-2xl">
+        ${contentHTML}
+      </div>
+    </div>`);
+  root.appendChild(overlay);
+  if (opts.closeOnBackdrop !== false) {
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
+  }
+  return overlay;
+}
+function closeModal() { $('#modalRoot').innerHTML = ''; }
+
+function errorModal(title, message) {
+  showModal(`
+    <div class="flex items-start gap-3 mb-3">
+      <div class="w-9 h-9 rounded-full bg-mafiaDim flex items-center justify-center text-mafia text-lg font-bold shrink-0">!</div>
+      <div>
+        <h3 class="font-display text-lg text-mafia uppercase tracking-wide">${title}</h3>
+        <p class="text-sm text-paper/70 mt-1">${message}</p>
+      </div>
+    </div>
+    <button onclick="closeModal()" class="btn-press mt-2 w-full py-3 rounded-xl bg-panel2 border border-hairline text-paper font-medium">Understood</button>
+  `);
+}
+
+/* ------------------------------ Render Root ------------------------------- */
+
+function render() {
+  const app = $('#app');
+  app.innerHTML = '';
+  const viewMap = {
+    menu: renderMenu,
+    settings: renderSettings,
+    roleEditor: renderRoleEditor,
+    localSetup: renderLocalSetup,
+    passPlay: renderPassPlay,
+    gmGate: renderGmGate,
+    gmDashboard: renderGmDashboard,
+    onlineMenu: renderOnlineMenu,
+    onlineHost: renderOnlineHost,
+    onlineClient: renderOnlineClient,
+    onlineClientWait: renderOnlineClientWait,
+    onlineClientRole: renderOnlineClientRole,
+  };
+  const fn = viewMap[session.view] || renderMenu;
+  const node = el(`<div class="view flex-1 flex flex-col"></div>`);
+  app.appendChild(node);
+  fn(node);
+}
+
+function goto(view) { session.view = view; render(); window.scrollTo(0,0); }
+
+/* ------------------------------- Top Bar ---------------------------------- */
+
+function topBar(title, opts={}) {
+  return `
+  <div class="flex items-center justify-between px-5 pt-6 pb-4 sticky top-0 bg-ink/95 backdrop-blur z-10 border-b border-hairline">
+    <button onclick="${opts.back || "goto('menu')"}" class="w-10 h-10 rounded-full bg-panel2 border border-hairline flex items-center justify-center text-paper/80 active:scale-95">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M15 18l-6-6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <h1 class="font-display text-xl uppercase tracking-widest text-paper">${title}</h1>
+    <div class="w-10 h-10">${opts.right || ''}</div>
+  </div>`;
+}
+
+/* ================================ MAIN MENU ================================ */
+
+function renderMenu(root) {
+  root.innerHTML = `
+    <div class="flex-1 flex flex-col justify-center px-6 py-10">
+      <div class="text-center mb-10">
+        <div class="mx-auto w-16 h-16 rounded-full bg-panel2 border border-goldDim seal flex items-center justify-center mb-4">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none"><path d="M12 2l7 4v6c0 5-3.4 8.4-7 10-3.6-1.6-7-5-7-10V6l7-4z" stroke="#C9A227" stroke-width="1.6"/></svg>
+        </div>
+        <p class="case-stamp text-gold/60 text-xs mb-1">CASE FILE №${String(state.stats.gamesPlayed).padStart(3,'0')}</p>
+        <h1 class="font-display text-4xl uppercase tracking-widest">Tribunal</h1>
+        <p class="text-paper/50 text-sm mt-2">Mafia role distributor &amp; game master assistant</p>
+      </div>
+
+      <div class="flex flex-col gap-3">
+        ${menuBtn('Local Play', 'Pass-and-play on one device', "goto('localSetup')", 'gold')}
+        ${menuBtn('Online / Co-op', 'Distribute roles across devices', "goto('onlineMenu')", 'town')}
+        ${menuBtn('Game Master Dashboard', 'Moderate a live game', "goto('gmGate')", 'mafia')}
+        ${menuBtn('Settings', 'Roles, probabilities, presets', "goto('settings')", 'neutral')}
+      </div>
+    </div>
+    <div class="px-6 pb-6 text-center text-paper/30 text-xs">
+      ${state.roles.length} roles configured · ${state.stats.gamesPlayed} games run
+    </div>
+  `;
+}
+function menuBtn(title, sub, onclick, accent) {
+  return `
+  <button onclick="${onclick}" class="btn-press text-left bg-panel border border-hairline hover:border-${accent}/50 rounded-2xl px-5 py-4 flex items-center gap-4 transition-colors">
+    <div class="w-2 h-10 rounded-full bg-${accent}"></div>
+    <div class="flex-1">
+      <div class="font-display text-lg uppercase tracking-wide">${title}</div>
+      <div class="text-paper/50 text-sm">${sub}</div>
+    </div>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" class="text-paper/30"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>`;
+}
+
+/* ================================ SETTINGS ================================= */
+
+function renderSettings(root) {
+  root.innerHTML = `
+    ${topBar('Settings')}
+    <div class="flex-1 overflow-y-auto px-5 py-5 space-y-6 pb-24">
+
+      <section>
+        <h2 class="case-stamp text-gold/70 text-xs mb-2">QUICK PRESETS</h2>
+        <div class="grid grid-cols-1 gap-2">
+          ${Object.entries(PRESETS).map(([key,p]) => `
+            <button onclick="applyPreset('${key}')" class="btn-press bg-panel border border-hairline rounded-xl px-4 py-3 text-left flex items-center justify-between">
+              <span class="font-medium">${p.label}</span>
+              <span class="text-paper/40 text-sm">Load →</span>
+            </button>`).join('')}
+        </div>
+      </section>
+
+      <section>
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="case-stamp text-gold/70 text-xs">ROLES (${state.roles.length})</h2>
+          <button onclick="openRoleEditor(null)" class="text-gold text-sm font-medium">+ Add Role</button>
+        </div>
+        <div class="space-y-2">
+          ${state.roles.map(r => roleRow(r)).join('')}
+        </div>
+      </section>
+
+      <section class="space-y-3">
+        <h2 class="case-stamp text-gold/70 text-xs mb-1">RULES</h2>
+        <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
+          <div>
+            <div class="font-medium text-sm">Teammate Awareness</div>
+            <div class="text-paper/40 text-xs">Same-team &amp; pair roles see each other's names</div>
+          </div>
+          <input type="checkbox" class="w-5 h-5" ${state.settings.teammateAwareness ? 'checked' : ''} onchange="state.settings.teammateAwareness=this.checked; saveState()">
+        </label>
+        <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
+          <div>
+            <div class="font-medium text-sm">Shuffle Turn Order</div>
+            <div class="text-paper/40 text-xs">Default for pass-and-play sequence</div>
+          </div>
+          <input type="checkbox" class="w-5 h-5" ${state.settings.shuffleTurnOrder ? 'checked' : ''} onchange="state.settings.shuffleTurnOrder=this.checked; saveState()">
+        </label>
+        <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
+          <div>
+            <div class="font-medium text-sm">GM Dashboard Password</div>
+            <div class="text-paper/40 text-xs">Required to view the host summary</div>
+          </div>
+          <input type="text" value="${state.settings.gmPassword}" class="w-24 bg-panel2 border border-hairline rounded-lg px-2 py-1 text-center font-mono text-sm" onchange="state.settings.gmPassword=this.value; saveState()">
+        </label>
+      </section>
+
+      <button onclick="resetRolesToDefault()" class="text-paper/30 text-xs underline mx-auto block pt-2">Restore default role set</button>
+    </div>
+  `;
+}
+
+function roleRow(r) {
+  const c = alignColor(r.alignment);
+  return `
+  <button onclick="openRoleEditor('${r.id}')" class="btn-press w-full bg-panel border border-hairline rounded-xl px-4 py-3 flex items-center gap-3 text-left">
+    <span class="text-[10px] font-mono w-6 text-paper/40">${r.wakeOrder > 0 ? '#'+r.wakeOrder : '—'}</span>
+    <span class="w-2.5 h-2.5 rounded-full bg-${c} shrink-0"></span>
+    <div class="flex-1 min-w-0">
+      <div class="font-medium truncate">${r.name} ${r.isPair ? '<span class="text-[10px] text-gold/70 border border-goldDim rounded px-1 ml-1 align-middle">PAIR</span>' : ''}</div>
+      <div class="text-paper/40 text-xs truncate">${alignLabel(r.alignment)} · min ${r.minCount} · weight ${r.weight}</div>
+    </div>
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" class="text-paper/30 shrink-0"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>`;
+}
+
+function applyPreset(key) {
+  const p = PRESETS[key];
+  if (!p) return;
+  state.roles.forEach(r => { r.minCount = p.minCounts[r.id] || 0; });
+  saveState();
+  session.presetPlayerCount = p.players;
+  render();
+  showModal(`
+    <h3 class="font-display text-lg uppercase mb-2">${p.label} loaded</h3>
+    <p class="text-sm text-paper/60 mb-4">Guaranteed role counts updated. Suggested table size: <b>${p.players} players</b>. Head to Local or Online play to start.</p>
+    <button onclick="closeModal()" class="btn-press w-full py-3 rounded-xl bg-gold text-ink font-semibold">Got it</button>
+  `);
+}
+function resetRolesToDefault() {
+  showModal(`
+    <h3 class="font-display text-lg uppercase mb-2 text-mafia">Restore defaults?</h3>
+    <p class="text-sm text-paper/60 mb-4">This replaces your custom role list with the six built-in roles.</p>
+    <div class="flex gap-2">
+      <button onclick="closeModal()" class="flex-1 py-3 rounded-xl bg-panel2 border border-hairline">Cancel</button>
+      <button onclick="state.roles=structuredClone(DEFAULT_ROLES); saveState(); closeModal(); render();" class="flex-1 py-3 rounded-xl bg-mafia text-white font-semibold">Restore</button>
+    </div>
+  `);
+}
+
+/* ------------------------------ Role Editor -------------------------------- */
+
+let editingRoleId = null;
+function openRoleEditor(id) { editingRoleId = id; goto('roleEditor'); }
+
+function renderRoleEditor(root) {
+  const isNew = !editingRoleId;
+  const r = isNew ? { id:null, name:'', alignment:'town', wakeOrder:0, minCount:0, weight:1, isPair:false, description:'' } : roleById(editingRoleId);
+  root.innerHTML = `
+    ${topBar(isNew ? 'New Role' : 'Edit Role', { back:"goto('settings')" })}
+    <div class="flex-1 overflow-y-auto px-5 py-5 space-y-4 pb-28">
+      <div>
+        <label class="text-xs case-stamp text-gold/70">ROLE NAME</label>
+        <input id="f_name" value="${r.name}" placeholder="e.g. Detective" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold">
+      </div>
+      <div>
+        <label class="text-xs case-stamp text-gold/70">ALIGNMENT</label>
+        <div class="mt-1 grid grid-cols-3 gap-2">
+          ${['town','mafia','neutral'].map(a => `
+            <button type="button" onclick="selectAlign('${a}')" data-align="${a}" class="align-btn btn-press py-3 rounded-xl border ${r.alignment===a ? `bg-${alignColor(a)} text-ink border-${alignColor(a)} font-semibold` : 'bg-panel border-hairline text-paper/60'}">${alignLabel(a)}</button>
+          `).join('')}
+        </div>
+      </div>
+      <div>
+        <label class="text-xs case-stamp text-gold/70">DESCRIPTION</label>
+        <textarea id="f_desc" rows="3" placeholder="What does this role do?" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold resize-none">${r.description}</textarea>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs case-stamp text-gold/70">WAKE ORDER</label>
+          <input id="f_wake" type="number" min="0" value="${r.wakeOrder}" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold">
+          <p class="text-[11px] text-paper/30 mt-1">0 = no night action</p>
+        </div>
+        <div>
+          <label class="text-xs case-stamp text-gold/70">GUARANTEED MIN.</label>
+          <input id="f_min" type="number" min="0" value="${r.minCount}" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold">
+        </div>
+      </div>
+      <div>
+        <div class="flex justify-between items-center">
+          <label class="text-xs case-stamp text-gold/70">WEIGHTED PROBABILITY</label>
+          <span id="f_weight_val" class="font-mono text-sm text-gold">${r.weight}</span>
+        </div>
+        <input id="f_weight" type="range" min="0" max="10" step="1" value="${r.weight}" class="w-full mt-2" oninput="document.getElementById('f_weight_val').textContent=this.value">
+        <p class="text-[11px] text-paper/30 mt-1">Higher = more likely to fill remaining open slots</p>
+      </div>
+      <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
+        <div>
+          <div class="font-medium text-sm">Pair Role</div>
+          <div class="text-paper/40 text-xs">Must always be assigned in twos (e.g. Lovers, Twins)</div>
+        </div>
+        <input id="f_pair" type="checkbox" class="w-5 h-5" ${r.isPair ? 'checked' : ''}>
+      </label>
+    </div>
+    <div class="px-5 py-4 border-t border-hairline sticky bottom-0 bg-ink/95 backdrop-blur flex gap-2">
+      ${!isNew ? `<button onclick="deleteRole('${r.id}')" class="btn-press px-5 py-3 rounded-xl bg-mafiaDim border border-mafia text-mafia font-medium">Delete</button>` : ''}
+      <button onclick="saveRole(${isNew ? 'null' : `'${r.id}'`})" class="btn-press flex-1 py-3 rounded-xl bg-gold text-ink font-semibold">Save Role</button>
+    </div>
+  `;
+  window.__editAlign = r.alignment;
+}
+function selectAlign(a) {
+  window.__editAlign = a;
+  document.querySelectorAll('.align-btn').forEach(b => {
+    const align = b.dataset.align;
+    const c = alignColor(align);
+    if (align === a) b.className = `align-btn btn-press py-3 rounded-xl border bg-${c} text-ink border-${c} font-semibold`;
+    else b.className = `align-btn btn-press py-3 rounded-xl border bg-panel border-hairline text-paper/60`;
+  });
+}
+function saveRole(id) {
+  const name = $('#f_name').value.trim();
+  if (!name) { errorModal('Missing name', 'Every role needs a name.'); return; }
+  const payload = {
+    name,
+    alignment: window.__editAlign || 'town',
+    description: $('#f_desc').value.trim(),
+    wakeOrder: parseInt($('#f_wake').value) || 0,
+    minCount: parseInt($('#f_min').value) || 0,
+    weight: parseInt($('#f_weight').value) || 0,
+    isPair: $('#f_pair').checked,
+  };
+  if (payload.isPair && payload.minCount % 2 !== 0) {
+    payload.minCount = payload.minCount + 1; // round up to keep pairs valid
+  }
+  if (id) {
+    Object.assign(roleById(id), payload);
+  } else {
+    payload.id = payload.name.toLowerCase().replace(/[^a-z0-9]+/g,'-') + '-' + Date.now().toString(36);
+    state.roles.push(payload);
+  }
+  saveState();
+  goto('settings');
+}
+function deleteRole(id) {
+  showModal(`
+    <h3 class="font-display text-lg uppercase mb-2 text-mafia">Delete this role?</h3>
+    <p class="text-sm text-paper/60 mb-4">This can't be undone.</p>
+    <div class="flex gap-2">
+      <button onclick="closeModal()" class="flex-1 py-3 rounded-xl bg-panel2 border border-hairline">Cancel</button>
+      <button onclick="state.roles = state.roles.filter(r=>r.id!=='${id}'); saveState(); closeModal(); goto('settings');" class="flex-1 py-3 rounded-xl bg-mafia text-white font-semibold">Delete</button>
+    </div>
+  `);
+}
+
+/* ============================ GAME ENGINE ================================= */
+
+/**
+ * Assigns roles to a list of player names.
+ * Returns { players:[{name, roleId}], error:null } or { error:'message' }
+ */
+function assignRoles(playerNames) {
+  const total = playerNames.length;
+  const roles = state.roles;
+
+  // sanitize pair minCounts to even numbers defensively
+  const guaranteedSum = roles.reduce((s,r) => s + Math.max(0, r.minCount), 0);
+  if (guaranteedSum > total) {
+    return { error: `Guaranteed roles require ${guaranteedSum} players but only ${total} are in the game. Lower some Guaranteed Minimum Counts in Settings.` };
+  }
+
+  let pool = [];
+  roles.forEach(r => {
+    for (let i=0;i<r.minCount;i++) pool.push(r.id);
+  });
+
+  let remaining = total - pool.length;
+
+  // Weighted fill of remaining slots
+  const fillable = () => roles.filter(r => r.weight > 0 && !(r.isPair && remaining < 2));
+  while (remaining > 0) {
+    const candidates = fillable();
+    if (candidates.length === 0) break; // nothing left can legally fill -> fallback pad
+    const totalWeight = candidates.reduce((s,r)=>s+r.weight,0);
+    let roll = Math.random() * totalWeight;
+    let chosen = candidates[candidates.length-1];
+    for (const c of candidates) {
+      if (roll < c.weight) { chosen = c; break; }
+      roll -= c.weight;
+    }
+    if (chosen.isPair) {
+      pool.push(chosen.id, chosen.id);
+      remaining -= 2;
+    } else {
+      pool.push(chosen.id);
+      remaining -= 1;
+    }
+  }
+
+  // Fallback: pad any leftover slots with Villager (or first town role, or create implicit villager)
+  let villager = roles.find(r => r.id === 'villager') || roles.find(r => r.alignment === 'town' && !r.isPair);
+  while (pool.length < total) {
+    pool.push(villager ? villager.id : 'villager');
+  }
+  // Safety trim if pair-weighting overshot
+  pool = pool.slice(0, total);
+
+  // Playability check: at least 1 mafia + 1 town
+  const hasAlignment = (align) => pool.some(id => roleById(id) && roleById(id).alignment === align);
+  if (!hasAlignment('mafia')) {
+    const mafiaRole = roles.find(r => r.alignment === 'mafia');
+    if (mafiaRole) {
+      const idx = pool.findIndex(id => roleById(id) && roleById(id).alignment !== 'mafia' && !(roleById(id).isPair));
+      if (idx !== -1) pool[idx] = mafiaRole.id;
+    }
+  }
+  if (!hasAlignment('town')) {
+    const townRole = villager;
+    const idx = pool.findIndex(id => roleById(id) && roleById(id).alignment !== 'town' && !(roleById(id).isPair));
+    if (townRole && idx !== -1) pool[idx] = townRole.id;
+  }
+
+  pool = shuffleArr(pool);
+  const players = playerNames.map((name, i) => ({ name, roleId: pool[i], alive:true, notes:'' }));
+  return { error:null, players };
+}
+
+function teammatesFor(player, allPlayers) {
+  if (!state.settings.teammateAwareness) return [];
+  const role = roleById(player.roleId);
+  if (!role) return [];
+  if (role.isPair) {
+    return allPlayers.filter(p => p !== player && p.roleId === player.roleId).map(p => p.name);
+  }
+  if (role.alignment === 'mafia') {
+    return allPlayers.filter(p => p !== player && roleById(p.roleId) && roleById(p.roleId).alignment === 'mafia').map(p => p.name);
+  }
+  return [];
+}
+
+/* ============================ LOCAL PLAY SETUP ============================= */
+
+let localPlayerCount = 6;
+let localNames = [];
+
+function renderLocalSetup(root) {
+  if (localNames.length !== localPlayerCount) {
+    localNames = Array.from({length:localPlayerCount}, (_,i) => localNames[i] || `Player ${i+1}`);
+  }
+  root.innerHTML = `
+    ${topBar('Local Play')}
+    <div class="flex-1 overflow-y-auto px-5 py-5 space-y-5 pb-28">
+      <div>
+        <div class="flex justify-between items-center mb-2">
+          <label class="text-xs case-stamp text-gold/70">PLAYER COUNT</label>
+          <span class="font-mono text-gold">${localPlayerCount}</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <button onclick="changeLocalCount(-1)" class="btn-press w-11 h-11 rounded-full bg-panel2 border border-hairline text-xl">−</button>
+          <input type="range" min="3" max="20" value="${localPlayerCount}" class="flex-1" oninput="setLocalCount(this.value)">
+          <button onclick="changeLocalCount(1)" class="btn-press w-11 h-11 rounded-full bg-panel2 border border-hairline text-xl">+</button>
+        </div>
+      </div>
+
+      <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
+        <div>
+          <div class="font-medium text-sm">Shuffle Turn Order</div>
+          <div class="text-paper/40 text-xs">Randomize pass-and-play sequence</div>
+        </div>
+        <input id="shuffleToggle" type="checkbox" class="w-5 h-5" ${state.settings.shuffleTurnOrder ? 'checked' : ''}>
+      </label>
+
+      <div>
+        <label class="text-xs case-stamp text-gold/70 mb-2 block">PLAYER NAMES</label>
+        <div class="space-y-2">
+          ${localNames.map((n,i) => `
+            <input value="${n}" oninput="localNames[${i}]=this.value" class="w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold" placeholder="Player ${i+1}">
+          `).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="px-5 py-4 border-t border-hairline sticky bottom-0 bg-ink/95 backdrop-blur">
+      <button onclick="startLocalGame()" class="btn-press w-full py-4 rounded-xl bg-gold text-ink font-display text-lg uppercase tracking-wide">Distribute Roles</button>
+    </div>
+  `;
+}
+function setLocalCount(v) { localPlayerCount = parseInt(v); render(); }
+function changeLocalCount(d) { localPlayerCount = Math.max(3, Math.min(20, localPlayerCount + d)); render(); }
+
+function startLocalGame() {
+  const shuffle = $('#shuffleToggle').checked;
+  state.settings.shuffleTurnOrder = shuffle;
+  saveState();
+  let names = localNames.map(n => n.trim() || n);
+  const result = assignRoles(names);
+  if (result.error) { errorModal('Cannot start game', result.error); return; }
+  let players = result.players;
+  if (shuffle) players = shuffleArr(players);
+  session.players = players;
+  session.passIndex = 0;
+  session.passRevealed = false;
+  state.stats.gamesPlayed++;
+  state.stats.lastPlayerCount = names.length;
+  saveState();
+  goto('passPlay');
+}
+
+/* ============================ PASS & PLAY =================================== */
+
+function renderPassPlay(root) {
+  if (session.passIndex >= session.players.length) {
+    root.innerHTML = `
+      <div class="flex-1 flex flex-col items-center justify-center px-6 text-center">
+        <div class="w-16 h-16 rounded-full bg-townDim border border-town flex items-center justify-center mb-4">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#3E9B6F" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <h2 class="font-display text-2xl uppercase mb-2">All roles distributed</h2>
+        <p class="text-paper/50 text-sm mb-8">Everyone has seen their secret role. The Game Master can now open the dashboard.</p>
+        <div class="flex flex-col gap-3 w-full max-w-xs">
+          <button onclick="goto('gmGate')" class="btn-press py-4 rounded-xl bg-gold text-ink font-display uppercase tracking-wide">Open GM Dashboard</button>
+          <button onclick="goto('menu')" class="btn-press py-4 rounded-xl bg-panel2 border border-hairline">Back to Menu</button>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const player = session.players[session.passIndex];
+  const role = roleById(player.roleId);
+  const c = alignColor(role.alignment);
+  const teammates = teammatesFor(player, session.players);
+
+  if (!session.passRevealed) {
+    root.innerHTML = `
+      <div class="flex-1 flex flex-col items-center justify-center px-6 text-center">
+        <p class="case-stamp text-paper/30 text-xs mb-2">PLAYER ${session.passIndex+1} OF ${session.players.length}</p>
+        <h2 class="font-display text-3xl uppercase mb-3">Pass phone to</h2>
+        <p class="font-display text-4xl text-gold mb-10">${player.name}</p>
+        <p class="text-paper/40 text-sm mb-8 max-w-xs">Make sure no one else can see the screen before revealing.</p>
+        <button onclick="session.passRevealed=true; render();" class="btn-press w-full max-w-xs py-4 rounded-xl bg-gold text-ink font-display text-lg uppercase tracking-wide">Reveal My Role</button>
+      </div>`;
+  } else {
+    root.innerHTML = `
+      <div class="flex-1 flex flex-col px-6 py-8">
+        <div class="text-center mb-6">
+          <p class="case-stamp text-paper/30 text-xs">${player.name.toUpperCase()}'S ROLE</p>
+        </div>
+        <div class="bg-panel border border-${c}/40 rounded-2xl p-6 flex-1 flex flex-col tab-fold relative overflow-hidden">
+          <div class="absolute top-0 right-0 bg-${c} text-ink text-xs font-bold px-3 py-1 rounded-bl-xl case-stamp">${alignLabel(role.alignment)}</div>
+          <div class="w-3 h-3 rounded-full bg-${c} mb-3 mt-2"></div>
+          <h2 class="font-display text-3xl uppercase text-${c} mb-3">${role.name}</h2>
+          <p class="text-paper/70 text-sm leading-relaxed mb-4">${role.description || 'No description provided.'}</p>
+          ${role.wakeOrder > 0 ? `<p class="text-xs text-gold/70 case-stamp mb-3">NIGHT ACTION · WAKE ORDER #${role.wakeOrder}</p>` : ''}
+          ${teammates.length ? `
+            <div class="mt-auto pt-4 border-t border-hairline">
+              <p class="text-xs case-stamp text-paper/40 mb-1">${role.isPair ? 'YOUR PARTNER' : 'YOUR TEAM'}</p>
+              <p class="text-paper font-medium">${teammates.join(', ')}</p>
+            </div>` : ''}
+        </div>
+        <button onclick="advancePassPlay()" class="btn-press w-full mt-6 py-4 rounded-xl bg-panel2 border border-hairline font-display uppercase tracking-wide">Hide &amp; Pass</button>
+      </div>`;
+  }
+}
+function advancePassPlay() {
+  session.passIndex++;
+  session.passRevealed = false;
+  render();
+}
+
+/* ============================ GM DASHBOARD =================================== */
+
+function renderGmGate(root) {
+  if (session.players.length === 0) {
+    root.innerHTML = `
+      ${topBar('Game Master')}
+      <div class="flex-1 flex flex-col items-center justify-center px-6 text-center">
+        <p class="text-paper/50">No active game found. Start a Local or Online game first, then return here.</p>
+      </div>`;
+    return;
+  }
+  root.innerHTML = `
+    ${topBar('Game Master')}
+    <div class="flex-1 flex flex-col items-center justify-center px-6 text-center">
+      <div class="w-14 h-14 rounded-full bg-panel2 border border-goldDim flex items-center justify-center mb-4">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="5" y="10" width="14" height="10" rx="2" stroke="#C9A227" stroke-width="1.8"/><path d="M8 10V7a4 4 0 018 0v3" stroke="#C9A227" stroke-width="1.8"/></svg>
+      </div>
+      <h2 class="font-display text-2xl uppercase mb-2">Host access</h2>
+      <p class="text-paper/40 text-sm mb-6">Enter the GM password to view the secret host summary.</p>
+      <input id="gmPass" type="password" placeholder="Password" class="w-full max-w-xs bg-panel border border-hairline rounded-xl px-4 py-3 text-center font-mono tracking-widest mb-4 focus:outline-none focus:border-gold">
+      <button onclick="checkGmPassword()" class="btn-press w-full max-w-xs py-4 rounded-xl bg-gold text-ink font-display uppercase tracking-wide">Unlock</button>
+    </div>`;
+}
+function checkGmPassword() {
+  const val = $('#gmPass').value;
+  if (val === state.settings.gmPassword) {
+    session.gmUnlocked = true;
+    goto('gmDashboard');
+  } else {
+    errorModal('Incorrect password', 'That password does not match the one set in Settings.');
+  }
+}
+
+function renderGmDashboard(root) {
+  if (!session.gmUnlocked) { goto('gmGate'); return; }
+  const players = session.players;
+  const nightOrder = players
+    .map(p => ({ p, role: roleById(p.roleId) }))
+    .filter(x => x.role && x.role.wakeOrder > 0 && x.p.alive)
+    .sort((a,b) => a.role.wakeOrder - b.role.wakeOrder);
+
+  root.innerHTML = `
+    ${topBar('GM Dashboard', { back: "goto('menu')" })}
+    <div class="flex-1 overflow-y-auto px-5 py-5 space-y-6 pb-10">
+
+      <section>
+        <h2 class="case-stamp text-gold/70 text-xs mb-2">ROUND TIMER</h2>
+        <div class="bg-panel border border-hairline rounded-2xl p-5 flex flex-col items-center">
+          <p id="timerDisplay" class="font-mono text-5xl text-gold tracking-wider mb-4">${formatTime(session.timer.remaining)}</p>
+          <div class="flex gap-2 w-full mb-3">
+            <button onclick="timerAdjust(-30)" class="flex-1 py-2 rounded-lg bg-panel2 border border-hairline text-sm">−30s</button>
+            <button onclick="timerAdjust(30)" class="flex-1 py-2 rounded-lg bg-panel2 border border-hairline text-sm">+30s</button>
+            <button onclick="timerAdjust(60)" class="flex-1 py-2 rounded-lg bg-panel2 border border-hairline text-sm">+1m</button>
+          </div>
+          <div class="flex gap-2 w-full">
+            <button onclick="timerToggle()" class="flex-1 py-3 rounded-xl ${session.timer.running ? 'bg-mafia' : 'bg-town'} text-ink font-semibold">${session.timer.running ? 'Pause' : 'Start'}</button>
+            <button onclick="timerReset()" class="flex-1 py-3 rounded-xl bg-panel2 border border-hairline">Reset</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2 class="case-stamp text-gold/70 text-xs mb-2">NIGHT ORDER CHECKLIST</h2>
+        <div class="space-y-2">
+          ${nightOrder.length === 0 ? `<p class="text-paper/30 text-sm">No living roles with a night action.</p>` :
+            nightOrder.map(({p,role},i) => `
+            <div class="bg-panel border border-hairline rounded-xl px-4 py-3 flex items-center gap-3">
+              <span class="font-mono text-gold w-6">${role.wakeOrder}</span>
+              <div class="flex-1">
+                <div class="font-medium text-sm">${role.name}</div>
+                <div class="text-paper/40 text-xs">${p.name}</div>
+              </div>
+              <span class="w-2.5 h-2.5 rounded-full bg-${alignColor(role.alignment)}"></span>
+            </div>`).join('')}
+        </div>
+      </section>
+
+      <section>
+        <h2 class="case-stamp text-gold/70 text-xs mb-2">PLAYERS &amp; SECRET ROLES</h2>
+        <div class="space-y-2">
+          ${players.map((p,i) => {
+            const role = roleById(p.roleId);
+            const c = alignColor(role.alignment);
+            return `
+            <div class="bg-panel border border-hairline rounded-xl px-4 py-3 ${p.alive ? '' : 'opacity-50'}">
+              <div class="flex items-center gap-3">
+                <span class="w-2.5 h-2.5 rounded-full bg-${c} shrink-0"></span>
+                <div class="flex-1 min-w-0">
+                  <div class="font-medium truncate">${p.name} ${!p.alive ? '<span class="text-mafia text-xs">(dead)</span>' : ''}</div>
+                  <div class="text-paper/40 text-xs">${role.name} · ${alignLabel(role.alignment)}</div>
+                </div>
+                <button onclick="togglePlayerAlive(${i})" class="btn-press px-3 py-1.5 rounded-lg text-xs font-semibold ${p.alive ? 'bg-mafiaDim text-mafia border border-mafia' : 'bg-townDim text-town border border-town'}">
+                  ${p.alive ? 'Mark Dead' : 'Revive'}
+                </button>
+              </div>
+              <input placeholder="Death note (optional)" value="${p.notes || ''}" oninput="updatePlayerNotes(${i}, this.value)" class="mt-2 w-full bg-panel2 border border-hairline rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-gold">
+            </div>`;
+          }).join('')}
+        </div>
+      </section>
+
+      <button onclick="endGame()" class="w-full py-3 rounded-xl bg-mafiaDim border border-mafia text-mafia font-medium">End Game &amp; Return to Menu</button>
+    </div>
+  `;
+}
+function togglePlayerAlive(i) { session.players[i].alive = !session.players[i].alive; render(); }
+function updatePlayerNotes(i, val) { session.players[i].notes = val; }
+function endGame() {
+  stopTimerInterval();
+  session.players = [];
+  session.gmUnlocked = false;
+  goto('menu');
+}
+
+function formatTime(sec) {
+  const m = Math.floor(sec/60).toString().padStart(2,'0');
+  const s = (sec%60).toString().padStart(2,'0');
+  return `${m}:${s}`;
+}
+function timerToggle() {
+  if (session.timer.running) {
+    stopTimerInterval();
+  } else {
+    session.timer.running = true;
+    session.timer.intervalId = setInterval(() => {
+      if (session.timer.remaining > 0) {
+        session.timer.remaining--;
+        const d = $('#timerDisplay');
+        if (d) d.textContent = formatTime(session.timer.remaining);
+      } else {
+        stopTimerInterval();
+      }
+    }, 1000);
+  }
+  render();
+}
+function stopTimerInterval() {
+  if (session.timer.intervalId) clearInterval(session.timer.intervalId);
+  session.timer.intervalId = null;
+  session.timer.running = false;
+}
+function timerReset() { stopTimerInterval(); session.timer.remaining = session.timer.seconds; render(); }
+function timerAdjust(d) {
+  session.timer.seconds = Math.max(30, session.timer.seconds + d);
+  session.timer.remaining = Math.max(0, session.timer.remaining + d);
+  render();
+}
+
+/* ============================ ONLINE / CO-OP ================================= */
+
+function renderOnlineMenu(root) {
+  root.innerHTML = `
+    ${topBar('Online / Co-op')}
+    <div class="flex-1 flex flex-col justify-center px-6 gap-4">
+      <p class="text-paper/40 text-sm text-center mb-2">Requires an internet connection. One device hosts; others join with a room code.</p>
+      <button onclick="goto('onlineHost')" class="btn-press bg-panel border border-hairline hover:border-gold/50 rounded-2xl px-5 py-5 text-left">
+        <div class="font-display text-lg uppercase">Host a Game</div>
+        <div class="text-paper/50 text-sm">Configure players &amp; distribute roles</div>
+      </button>
+      <button onclick="goto('onlineClient')" class="btn-press bg-panel border border-hairline hover:border-town/50 rounded-2xl px-5 py-5 text-left">
+        <div class="font-display text-lg uppercase">Join a Game</div>
+        <div class="text-paper/50 text-sm">Enter a 4-letter room code</div>
+      </button>
+    </div>
+  `;
+}
+
+/* --- HOST --- */
+function renderOnlineHost(root) {
+  if (!session.peer) initHostPeer();
+  root.innerHTML = `
+    ${topBar('Hosting', { back: "leaveOnline(); goto('onlineMenu');" })}
+    <div class="flex-1 overflow-y-auto px-5 py-5 space-y-5 pb-28">
+      <div class="text-center bg-panel border border-goldDim rounded-2xl py-6">
+        <p class="case-stamp text-paper/40 text-xs mb-1">ROOM CODE</p>
+        <p class="font-display text-5xl tracking-[0.3em] text-gold">${session.roomCode || '····'}</p>
+        <p class="text-paper/30 text-xs mt-2">${session.peer && session.peer.open ? 'Connected to relay' : 'Connecting…'}</p>
+      </div>
+
+      <div>
+        <h2 class="case-stamp text-gold/70 text-xs mb-2">PLAYERS JOINED (${session.onlinePlayers.length})</h2>
+        <div class="space-y-2">
+          ${session.onlinePlayers.length === 0 ? `<p class="text-paper/30 text-sm">Waiting for players to join…</p>` :
+            session.onlinePlayers.map((p,i) => `
+            <div class="bg-panel border border-hairline rounded-xl px-4 py-3 flex items-center justify-between">
+              <span class="font-medium">${p.name}</span>
+              <span class="text-town text-xs">● online</span>
+            </div>`).join('')}
+        </div>
+      </div>
+
+      <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
+        <div>
+          <div class="font-medium text-sm">Shuffle Turn Order</div>
+          <div class="text-paper/40 text-xs">Cosmetic — for host reference only</div>
+        </div>
+        <input id="onlineShuffle" type="checkbox" class="w-5 h-5" ${state.settings.shuffleTurnOrder ? 'checked' : ''}>
+      </label>
+    </div>
+    <div class="px-5 py-4 border-t border-hairline sticky bottom-0 bg-ink/95 backdrop-blur">
+      <button onclick="distributeOnlineRoles()" class="btn-press w-full py-4 rounded-xl bg-gold text-ink font-display text-lg uppercase tracking-wide" ${session.onlinePlayers.length < 3 ? 'disabled' : ''}>
+        ${session.onlinePlayers.length < 3 ? 'Need 3+ players' : 'Distribute Roles'}
+      </button>
+    </div>
+  `;
+}
+
+function initHostPeer() {
+  session.isHost = true;
+  session.roomCode = genRoomCode();
+  session.onlinePlayers = [];
+  try {
+    session.peer = new Peer('mafia-' + session.roomCode);
+    session.peer.on('open', () => { render(); });
+    session.peer.on('connection', (conn) => {
+      conn.on('data', (data) => {
+        if (data.type === 'join') {
+          session.onlinePlayers.push({ name: data.name, conn });
+          render();
+        }
+      });
+      conn.on('close', () => {
+        session.onlinePlayers = session.onlinePlayers.filter(p => p.conn !== conn);
+        render();
+      });
+    });
+    session.peer.on('error', (err) => {
+      errorModal('Connection error', 'Could not start the online session: ' + err.type + '. Check your internet connection.');
+    });
+  } catch(e) {
+    errorModal('PeerJS unavailable', 'The peer-to-peer library failed to load. Check your internet connection and try again.');
+  }
+}
+
+function distributeOnlineRoles() {
+  const names = session.onlinePlayers.map(p => p.name);
+  const result = assignRoles(names);
+  if (result.error) { errorModal('Cannot start game', result.error); return; }
+  session.players = result.players;
+  // send each player their role privately
+  session.players.forEach(p => {
+    const op = session.onlinePlayers.find(o => o.name === p.name);
+    const role = roleById(p.roleId);
+    const teammates = teammatesFor(p, session.players);
+    if (op) {
+      op.conn.send({ type:'role', role: { name: role.name, alignment: role.alignment, description: role.description, wakeOrder: role.wakeOrder }, teammates });
+    }
+  });
+  state.stats.gamesPlayed++;
+  state.stats.lastPlayerCount = names.length;
+  saveState();
+  showModal(`
+    <h3 class="font-display text-lg uppercase mb-2 text-town">Roles sent</h3>
+    <p class="text-sm text-paper/60 mb-4">Every connected player now has their secret role on their own device.</p>
+    <button onclick="closeModal(); goto('gmGate');" class="btn-press w-full py-3 rounded-xl bg-gold text-ink font-semibold">Open GM Dashboard</button>
+  `);
+}
+
+function leaveOnline() {
+  if (session.peer) { try { session.peer.destroy(); } catch(e){} }
+  session.peer = null;
+  session.roomCode = null;
+  session.onlinePlayers = [];
+  session.clientConn = null;
+}
+
+/* --- CLIENT --- */
+function renderOnlineClient(root) {
+  root.innerHTML = `
+    ${topBar('Join Game', { back: "goto('onlineMenu')" })}
+    <div class="flex-1 flex flex-col justify-center px-6 gap-4">
+      <div>
+        <label class="text-xs case-stamp text-gold/70">ROOM CODE</label>
+        <input id="joinCode" maxlength="4" placeholder="ABCD" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-4 text-center font-display text-3xl tracking-[0.3em] uppercase focus:outline-none focus:border-gold">
+      </div>
+      <div>
+        <label class="text-xs case-stamp text-gold/70">YOUR NAME</label>
+        <input id="joinName" placeholder="Enter your name" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 focus:outline-none focus:border-gold">
+      </div>
+      <button onclick="joinOnlineGame()" class="btn-press w-full py-4 rounded-xl bg-town text-ink font-display text-lg uppercase tracking-wide mt-2">Join Room</button>
+    </div>
+  `;
+}
+function joinOnlineGame() {
+  const code = $('#joinCode').value.trim().toUpperCase();
+  const name = $('#joinName').value.trim();
+  if (code.length !== 4) { errorModal('Invalid code', 'Room codes are exactly 4 letters.'); return; }
+  if (!name) { errorModal('Missing name', 'Please enter your name.'); return; }
+  session.isHost = false;
+  try {
+    session.peer = new Peer();
+    session.peer.on('open', () => {
+      const conn = session.peer.connect('mafia-' + code);
+      session.clientConn = conn;
+      conn.on('open', () => {
+        conn.send({ type:'join', name });
+        goto('onlineClientWait');
+      });
+      conn.on('data', (data) => {
+        if (data.type === 'role') {
+          session.myRole = data.role;
+          session.myTeammates = data.teammates || [];
+          goto('onlineClientRole');
+        }
+      });
+      conn.on('error', () => errorModal('Connection failed', 'Could not reach that room. Check the code and try again.'));
+    });
+    session.peer.on('error', (err) => errorModal('Connection error', err.type + '. Check your internet connection.'));
+  } catch(e) {
+    errorModal('PeerJS unavailable', 'The peer-to-peer library failed to load.');
+  }
+}
+function renderOnlineClientWait(root) {
+  root.innerHTML = `
+    <div class="flex-1 flex flex-col items-center justify-center px-6 text-center">
+      <div class="w-14 h-14 rounded-full border-2 border-gold/30 border-t-gold animate-spin mb-6"></div>
+      <h2 class="font-display text-2xl uppercase mb-2">Waiting for host</h2>
+      <p class="text-paper/40 text-sm">Your role will appear automatically once the Game Master distributes roles.</p>
+    </div>
+  `;
+}
+function renderOnlineClientRole(root) {
+  const role = session.myRole;
+  const c = alignColor(role.alignment);
+  root.innerHTML = `
+    <div class="flex-1 flex flex-col px-6 py-10">
+      <div class="bg-panel border border-${c}/40 rounded-2xl p-6 flex-1 flex flex-col tab-fold relative overflow-hidden">
+        <div class="absolute top-0 right-0 bg-${c} text-ink text-xs font-bold px-3 py-1 rounded-bl-xl case-stamp">${alignLabel(role.alignment)}</div>
+        <div class="w-3 h-3 rounded-full bg-${c} mb-3 mt-2"></div>
+        <h2 class="font-display text-3xl uppercase text-${c} mb-3">${role.name}</h2>
+        <p class="text-paper/70 text-sm leading-relaxed mb-4">${role.description || 'No description provided.'}</p>
+        ${role.wakeOrder > 0 ? `<p class="text-xs text-gold/70 case-stamp mb-3">NIGHT ACTION · WAKE ORDER #${role.wakeOrder}</p>` : ''}
+        ${session.myTeammates && session.myTeammates.length ? `
+          <div class="mt-auto pt-4 border-t border-hairline">
+            <p class="text-xs case-stamp text-paper/40 mb-1">YOUR TEAM</p>
+            <p class="text-paper font-medium">${session.myTeammates.join(', ')}</p>
+          </div>` : ''}
+      </div>
+      <p class="text-center text-paper/30 text-xs mt-6">Keep this screen private. Do not show it to other players.</p>
+    </div>
+  `;
+}
+
+/* ================================ Boot ===================================== */
+render();
+
+</script>
+</body>
+</html>
