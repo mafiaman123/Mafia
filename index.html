@@ -82,25 +82,48 @@ const STORAGE_KEY = 'tribunal_state_v2';
 const SESSION_KEY = 'tribunal_session_v2';
 
 const DEFAULT_ROLES = [
-  { id:'villager', name:'Villager', alignment:'town', wakeOrder:0, minCount:0, maxCount:null, weight:10, isPair:false,
+  { id:'villager', name:'Villager', alignment:'town', wakeOrder:0, isPair:false, isBase:true,
     description:'No special ability. Use the day phase to observe, debate and vote out threats.' },
-  { id:'mafia', name:'Mafia', alignment:'mafia', wakeOrder:3, minCount:1, maxCount:null, weight:5, isPair:false,
+  { id:'mafia', name:'Mafia', alignment:'mafia', wakeOrder:3, isPair:false, isBase:true, teamSize:2,
     description:'Wakes each night with fellow Mafia to choose one player to eliminate.' },
-  { id:'doctor', name:'Doctor', alignment:'town', wakeOrder:2, minCount:1, maxCount:1, weight:3, isPair:false,
+  { id:'doctor', name:'Doctor', alignment:'town', wakeOrder:2, isPair:false, isBase:false, maxCount:1, probability:100,
     description:'Wakes each night to protect one player from elimination.' },
-  { id:'sheriff', name:'Sheriff', alignment:'town', wakeOrder:1, minCount:1, maxCount:1, weight:3, isPair:false,
+  { id:'sheriff', name:'Sheriff', alignment:'town', wakeOrder:1, isPair:false, isBase:false, maxCount:1, probability:100,
     description:'Wakes each night to investigate one player and learn their alignment.' },
-  { id:'jester', name:'Jester', alignment:'neutral', wakeOrder:0, minCount:0, maxCount:1, weight:1, isPair:false,
+  { id:'jester', name:'Jester', alignment:'neutral', wakeOrder:0, isPair:false, isBase:false, maxCount:1, probability:20,
     description:'Wins alone if voted out by the town during a day phase.' },
-  { id:'lovers', name:'Lovers', alignment:'neutral', wakeOrder:0, minCount:0, maxCount:2, weight:2, isPair:true,
+  { id:'lovers', name:'Lovers', alignment:'neutral', wakeOrder:0, isPair:true, isBase:false, maxCount:2, probability:25,
     description:'Two secretly bound players. If one dies, the other dies of grief.' },
 ];
 
+/**
+ * Migrates a role saved under the old schema (minCount/maxCount/weight) into the
+ * new Among-Us-style schema (isBase + teamSize, or maxCount "Number" + probability %).
+ */
 function migrateRole(r) {
-  if (r.maxCount === undefined) {
-    r.maxCount = (r.id === 'villager' || r.id === 'mafia') ? null : (r.isPair ? 2 : 1);
+  if (r.probability !== undefined || r.isBase !== undefined) return r; // already current schema
+  if (r.id === 'villager') {
+    const { minCount, maxCount, weight, ...rest } = r;
+    return { ...rest, isBase:true, alignment:'town' };
   }
-  return r;
+  if (r.id === 'mafia') {
+    const teamSize = (r.minCount && r.minCount > 0) ? r.minCount : 2;
+    const { minCount, maxCount, weight, ...rest } = r;
+    return { ...rest, isBase:true, alignment:'mafia', teamSize };
+  }
+  const maxCount = (r.maxCount == null) ? 1 : r.maxCount;
+  const probability = Math.max(0, Math.min(100, r.weight != null ? r.weight : 50));
+  const { minCount, weight, ...rest } = r;
+  return { ...rest, isBase:false, maxCount, probability };
+}
+function ensureBaseRoles(roles) {
+  if (!roles.some(r => r.isBase && r.alignment === 'mafia')) {
+    roles.unshift(structuredClone(DEFAULT_ROLES.find(r => r.id === 'mafia')));
+  }
+  if (!roles.some(r => r.isBase && r.alignment === 'town')) {
+    roles.unshift(structuredClone(DEFAULT_ROLES.find(r => r.id === 'villager')));
+  }
+  return roles;
 }
 
 function loadState() {
@@ -108,14 +131,15 @@ function loadState() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      parsed.roles = (parsed.roles && parsed.roles.length ? parsed.roles : structuredClone(DEFAULT_ROLES)).map(migrateRole);
-      parsed.presets = parsed.presets || [];
+      const wasOldSchema = parsed.roles && parsed.roles.length && parsed.roles[0].probability === undefined && parsed.roles[0].isBase === undefined;
+      parsed.roles = ensureBaseRoles((parsed.roles && parsed.roles.length ? parsed.roles : structuredClone(DEFAULT_ROLES)).map(migrateRole));
+      parsed.presets = wasOldSchema ? [] : (parsed.presets || []); // old preset snapshots use an incompatible shape
       parsed.playerNameMemory = parsed.playerNameMemory || [];
       parsed.settings = parsed.settings || {};
       if (parsed.settings.teammateAwareness === undefined) parsed.settings.teammateAwareness = true;
       if (parsed.settings.gmPassword === undefined) parsed.settings.gmPassword = '1234';
       if (parsed.settings.shuffleTurnOrder === undefined) parsed.settings.shuffleTurnOrder = true;
-      if (!parsed.settings.alignmentQuotas) parsed.settings.alignmentQuotas = { mafia:null, town:null, neutral:null };
+      delete parsed.settings.alignmentQuotas;
       parsed.stats = parsed.stats || { gamesPlayed:0, lastPlayerCount:0 };
       return parsed;
     }
@@ -124,7 +148,7 @@ function loadState() {
     roles: structuredClone(DEFAULT_ROLES),
     presets: [],
     playerNameMemory: [],
-    settings: { teammateAwareness:true, gmPassword:'1234', shuffleTurnOrder:true, alignmentQuotas:{ mafia:null, town:null, neutral:null } },
+    settings: { teammateAwareness:true, gmPassword:'1234', shuffleTurnOrder:true },
     stats: { gamesPlayed:0, lastPlayerCount:0 },
   };
 }
@@ -166,6 +190,15 @@ let session = {
   gmUnlocked: false,
 };
 loadSessionFromStorage();
+
+// If this page was opened via a "Show QR Code" scan (?join=CODE), jump straight to the Join screen
+const __urlParams = new URLSearchParams(location.search);
+const prefillJoinCode = (__urlParams.get('join') || '').toUpperCase().replace(/[^A-Z]/g,'').slice(0,4);
+if (prefillJoinCode) {
+  session.view = 'onlineClient';
+  history.replaceState({}, '', location.pathname);
+}
+let showHostQR = false;
 
 /* ------------------------------ Utilities -------------------------------- */
 
@@ -282,7 +315,6 @@ function menuBtn(title, sub, onclick, accent) {
 /* ================================ SETTINGS ================================= */
 
 function renderSettings(root) {
-  const q = state.settings.alignmentQuotas;
   root.innerHTML = `
     ${topBar('Settings')}
     <div class="flex-1 overflow-y-auto px-5 py-5 space-y-6 pb-24">
@@ -315,6 +347,7 @@ function renderSettings(root) {
             <button onclick="openRoleEditor(null)" class="text-gold text-sm font-medium">+ Add Role</button>
           </div>
         </div>
+        <p class="text-paper/40 text-xs mb-2">Villager and Mafia are your two base roles — anyone who doesn't get a special role becomes one of these. Every other role has a Number (max in the game) and a Probability (% chance for each eligible player).</p>
         ${roleSelectMode ? `
         <button onclick="exportSelectedRoles()" class="btn-press w-full mb-2 py-2.5 rounded-xl bg-gold text-ink text-sm font-semibold" ${selectedRoleIds.size===0 ? 'disabled' : ''}>
           Share Selected (${selectedRoleIds.size})
@@ -325,24 +358,9 @@ function renderSettings(root) {
       </section>
 
       <section>
-        <h2 class="case-stamp text-gold/70 text-xs mb-2">TEAM QUOTAS</h2>
-        <p class="text-paper/40 text-xs mb-2">Force an exact total headcount for a team, filled from any role under that alignment — for example a Mafia quota of 2 could be met by any mix of your Mafia-aligned roles, but the team will never exceed 2 players total. Leave blank for no quota.</p>
-        <div class="grid grid-cols-3 gap-2">
-          ${['mafia','town','neutral'].map(a => `
-            <div>
-              <label class="text-xs text-${alignColor(a)} case-stamp block mb-1">${alignLabel(a)}</label>
-              <input type="number" min="0" value="${q[a] ?? ''}" placeholder="—" class="w-full bg-panel border border-hairline rounded-lg px-2 py-2 text-center focus:outline-none focus:border-gold" onchange="setQuota('${a}', this.value)">
-            </div>`).join('')}
-        </div>
-      </section>
-
-      <section>
-        <h2 class="case-stamp text-gold/70 text-xs mb-2">SHARE &amp; BACKUP</h2>
-        <p class="text-paper/40 text-xs mb-2">Export your roles, presets and quotas as text to send to another Tribunal user, or paste in something they sent you.</p>
-        <div class="grid grid-cols-2 gap-2">
-          <button onclick="exportFullSetup()" class="btn-press py-3 rounded-xl bg-panel border border-hairline text-sm font-medium">Export Full Setup</button>
-          <button onclick="openImportModal()" class="btn-press py-3 rounded-xl bg-panel border border-hairline text-sm font-medium">Import</button>
-        </div>
+        <h2 class="case-stamp text-gold/70 text-xs mb-2">SHARE ROLES</h2>
+        <p class="text-paper/40 text-xs mb-2">To share your whole setup, tap "Select" above and select every role. To grab someone else's roles, paste what they sent you below.</p>
+        <button onclick="openImportModal()" class="btn-press w-full py-3 rounded-xl bg-panel border border-hairline text-sm font-medium">Import Roles</button>
       </section>
 
       <section class="space-y-3">
@@ -365,6 +383,7 @@ function renderSettings(root) {
           <div>
             <div class="font-medium text-sm">GM Dashboard Password</div>
             <div class="text-paper/40 text-xs">Required to view the host summary</div>
+
           </div>
           <input type="text" value="${state.settings.gmPassword}" class="w-24 bg-panel2 border border-hairline rounded-lg px-2 py-1 text-center font-mono text-sm" onchange="state.settings.gmPassword=this.value; saveState()">
         </label>
@@ -383,21 +402,8 @@ function toggleRoleSelected(id) {
   render();
 }
 
-function isRoleLocked(r) { return r.maxCount != null && r.minCount === r.maxCount; }
-function fillableRoles() { return state.roles.filter(r => !isRoleLocked(r) && r.weight > 0); }
-function effectiveProbabilityLabel(r) {
-  if (r.weight <= 0) return '0% chance';
-  const pool = fillableRoles();
-  if (!pool.some(x => x.id === r.id)) return '0% chance';
-  const totalWeight = pool.reduce((s,x) => s + x.weight, 0);
-  if (totalWeight <= 0) return '0% chance';
-  return '≈' + Math.round((r.weight / totalWeight) * 100) + '% of open slots';
-}
-
 function roleRow(r) {
   const c = alignColor(r.alignment);
-  const maxLabel = r.maxCount == null ? '∞' : r.maxCount;
-  const locked = isRoleLocked(r);
 
   if (roleSelectMode) {
     const checked = selectedRoleIds.has(r.id);
@@ -412,22 +418,21 @@ function roleRow(r) {
     </button>`;
   }
 
+  let detail;
+  if (r.isBase && r.alignment === 'mafia') detail = `Team size: ${r.teamSize}`;
+  else if (r.isBase) detail = `Base role — fills every remaining slot`;
+  else detail = `Number ${r.maxCount} · ${r.probability}% chance`;
+
   return `
   <button onclick="openRoleEditor('${r.id}')" class="btn-press w-full bg-panel border border-hairline rounded-xl px-4 py-3 flex items-center gap-3 text-left">
     <span class="text-[10px] font-mono w-6 text-paper/40">${r.wakeOrder > 0 ? '#'+r.wakeOrder : '—'}</span>
     <span class="w-2.5 h-2.5 rounded-full bg-${c} shrink-0"></span>
     <div class="flex-1 min-w-0">
-      <div class="font-medium truncate">${r.name} ${r.isPair ? '<span class="text-[10px] text-gold/70 border border-goldDim rounded px-1 ml-1 align-middle">PAIR</span>' : ''} ${locked ? '<span class="text-[10px] text-paper/50 border border-hairline rounded px-1 ml-1 align-middle">GUARANTEED</span>' : ''}</div>
-      <div class="text-paper/40 text-xs truncate">${alignLabel(r.alignment)} · min ${r.minCount} · max ${maxLabel}${locked ? '' : ' · ' + effectiveProbabilityLabel(r)}</div>
+      <div class="font-medium truncate">${r.name} ${r.isPair ? '<span class="text-[10px] text-gold/70 border border-goldDim rounded px-1 ml-1 align-middle">PAIR</span>' : ''} ${r.isBase ? '<span class="text-[10px] text-paper/50 border border-hairline rounded px-1 ml-1 align-middle">BASE</span>' : ''}</div>
+      <div class="text-paper/40 text-xs truncate">${alignLabel(r.alignment)} · ${detail}</div>
     </div>
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" class="text-paper/30 shrink-0"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
   </button>`;
-}
-
-function setQuota(align, val) {
-  const n = parseInt(val);
-  state.settings.alignmentQuotas[align] = (isNaN(n) || n <= 0) ? null : n;
-  saveState();
 }
 
 function resetRolesToDefault() {
@@ -446,7 +451,7 @@ function resetRolesToDefault() {
 function saveCurrentPreset() {
   showModal(`
     <h3 class="font-display text-lg uppercase mb-2">Save preset</h3>
-    <p class="text-sm text-paper/60 mb-4">Captures every role's min/max/weight, plus team quotas.</p>
+    <p class="text-sm text-paper/60 mb-4">Captures the Mafia team size plus every special role's Number and Probability.</p>
     <input id="presetNameInput" placeholder="Preset name" class="w-full bg-panel2 border border-hairline rounded-xl px-4 py-3 mb-4 focus:outline-none focus:border-gold">
     <button onclick="confirmSavePreset()" class="btn-press w-full py-3 rounded-xl bg-gold text-ink font-semibold">Save</button>
   `);
@@ -455,8 +460,7 @@ function confirmSavePreset() {
   const name = $('#presetNameInput').value.trim();
   if (!name) { errorModal('Missing name', 'Give your preset a name.'); return; }
   const snapshot = {
-    roles: state.roles.map(r => ({ id:r.id, minCount:r.minCount, maxCount:r.maxCount, weight:r.weight })),
-    quotas: { ...state.settings.alignmentQuotas },
+    roles: state.roles.map(r => ({ id:r.id, teamSize:r.teamSize, maxCount:r.maxCount, probability:r.probability })),
   };
   state.presets.push({ id:'preset-'+Date.now().toString(36), name, snapshot });
   saveState();
@@ -468,14 +472,15 @@ function loadPreset(id) {
   if (!p) return;
   p.snapshot.roles.forEach(sr => {
     const role = roleById(sr.id);
-    if (role) { role.minCount = sr.minCount; role.maxCount = sr.maxCount; role.weight = sr.weight; }
+    if (!role) return;
+    if (role.isBase && role.alignment === 'mafia' && sr.teamSize != null) role.teamSize = sr.teamSize;
+    if (!role.isBase) { if (sr.maxCount != null) role.maxCount = sr.maxCount; if (sr.probability != null) role.probability = sr.probability; }
   });
-  if (p.snapshot.quotas) state.settings.alignmentQuotas = { ...p.snapshot.quotas };
   saveState();
   render();
   showModal(`
     <h3 class="font-display text-lg uppercase mb-2">${p.name} loaded</h3>
-    <p class="text-sm text-paper/60 mb-4">Role quotas, limits and probabilities updated.</p>
+    <p class="text-sm text-paper/60 mb-4">Mafia team size and role probabilities updated.</p>
     <button onclick="closeModal()" class="btn-press w-full py-3 rounded-xl bg-gold text-ink font-semibold">Got it</button>
   `);
 }
@@ -549,21 +554,11 @@ function exportSelectedRoles() {
   if (roles.length === 0) { errorModal('Nothing selected', 'Select at least one role first.'); return; }
   showExportModal('Export ' + roles.length + ' Role' + (roles.length > 1 ? 's' : ''), JSON.stringify({ type:'tribunal-roles', roles }, null, 2));
 }
-function exportFullSetup() {
-  const payload = {
-    type: 'tribunal-setup',
-    roles: state.roles,
-    presets: state.presets,
-    alignmentQuotas: state.settings.alignmentQuotas,
-    teammateAwareness: state.settings.teammateAwareness,
-  };
-  showExportModal('Export Full Setup', JSON.stringify(payload, null, 2));
-}
 
 function openImportModal() {
   showModal(`
-    <h3 class="font-display text-lg uppercase mb-2">Import</h3>
-    <p class="text-sm text-paper/60 mb-3">Paste a Tribunal export below. Imported roles are added alongside your existing ones — nothing is overwritten.</p>
+    <h3 class="font-display text-lg uppercase mb-2">Import Roles</h3>
+    <p class="text-sm text-paper/60 mb-3">Paste a Tribunal role export below. Imported roles are added alongside your existing ones as regular special roles — nothing is overwritten.</p>
     <textarea id="importTextarea" placeholder="Paste JSON here" class="w-full h-40 bg-panel2 border border-hairline rounded-xl px-3 py-2 text-xs font-mono mb-3 focus:outline-none focus:border-gold"></textarea>
     <button onclick="confirmImport()" class="btn-press w-full py-3 rounded-xl bg-gold text-ink font-semibold">Import</button>
   `);
@@ -575,9 +570,9 @@ function confirmImport() {
   try { data = JSON.parse(raw); } catch(e) { errorModal('Invalid data', "That doesn't look like valid exported text."); return; }
 
   let importedRoles = [];
-  if (data && (data.type === 'tribunal-roles' || data.type === 'tribunal-setup') && Array.isArray(data.roles)) importedRoles = data.roles;
+  if (data && data.type === 'tribunal-roles' && Array.isArray(data.roles)) importedRoles = data.roles;
   else if (Array.isArray(data)) importedRoles = data;
-  else { errorModal('Unrecognized format', "This text doesn't match a Tribunal export."); return; }
+  else { errorModal('Unrecognized format', "This text doesn't match a Tribunal role export."); return; }
 
   let added = 0;
   importedRoles.forEach(r => {
@@ -589,25 +584,16 @@ function confirmImport() {
     }
     clone.alignment = ['town','mafia','neutral'].includes(clone.alignment) ? clone.alignment : 'town';
     clone.wakeOrder = parseInt(clone.wakeOrder) || 0;
-    clone.minCount = Math.max(0, parseInt(clone.minCount) || 0);
     clone.isPair = !!clone.isPair;
-    if (clone.isPair && clone.minCount % 2 !== 0) clone.minCount += 1;
-    clone.maxCount = (clone.maxCount === undefined || clone.maxCount === null) ? null : Math.max(clone.minCount, parseInt(clone.maxCount) || clone.minCount);
-    if (clone.maxCount != null && clone.isPair && clone.maxCount % 2 !== 0) clone.maxCount += 1;
-    clone.weight = Math.max(0, Math.min(100, parseInt(clone.weight) ?? 10));
+    clone.isBase = false; // imported roles are always regular special roles — a game only ever has one base Mafia and one base Town role
+    clone.maxCount = Math.max(1, parseInt(clone.maxCount) || 1);
+    if (clone.isPair && clone.maxCount % 2 !== 0) clone.maxCount += 1;
+    clone.probability = Math.max(0, Math.min(100, parseInt(clone.probability) ?? 50));
+    delete clone.teamSize;
     clone.description = clone.description || '';
     state.roles.push(clone);
     added++;
   });
-
-  if (data.type === 'tribunal-setup') {
-    if (Array.isArray(data.presets)) {
-      data.presets.forEach(p => {
-        if (p && p.name && p.snapshot) state.presets.push({ ...p, id: 'preset-' + Date.now().toString(36) + Math.floor(Math.random()*1000) });
-      });
-    }
-    if (data.alignmentQuotas) state.settings.alignmentQuotas = { ...state.settings.alignmentQuotas, ...data.alignmentQuotas };
-  }
 
   saveState();
   closeModal();
@@ -626,11 +612,17 @@ function openRoleEditor(id) { editingRoleId = id; goto('roleEditor'); }
 
 function renderRoleEditor(root) {
   const isNew = !editingRoleId;
-  const r = isNew ? { id:null, name:'', alignment:'town', wakeOrder:0, minCount:0, maxCount:1, weight:10, isPair:false, description:'' } : roleById(editingRoleId);
-  const unlimited = r.maxCount == null;
+  const r = isNew ? { id:null, name:'', alignment:'town', wakeOrder:0, isPair:false, isBase:false, maxCount:1, probability:50, description:'' } : roleById(editingRoleId);
+  const isBaseRole = !!r.isBase;
+
   root.innerHTML = `
     ${topBar(isNew ? 'New Role' : 'Edit Role', { back:"goto('settings')" })}
     <div class="flex-1 overflow-y-auto px-5 py-5 space-y-4 pb-28">
+      ${isBaseRole ? `
+      <div class="bg-panel2 border border-goldDim rounded-xl px-4 py-3 text-xs text-gold/80">
+        This is a base role. It can't be deleted or moved to a different alignment — every game needs exactly one base Mafia role and one base Town role as a fallback.
+      </div>` : ''}
+
       <div>
         <label class="text-xs case-stamp text-gold/70">ROLE NAME</label>
         <input id="f_name" value="${r.name}" placeholder="e.g. Detective" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold">
@@ -639,7 +631,7 @@ function renderRoleEditor(root) {
         <label class="text-xs case-stamp text-gold/70">ALIGNMENT</label>
         <div class="mt-1 grid grid-cols-3 gap-2">
           ${['town','mafia','neutral'].map(a => `
-            <button type="button" onclick="selectAlign('${a}')" data-align="${a}" class="align-btn btn-press py-3 rounded-xl border ${r.alignment===a ? `bg-${alignColor(a)} text-ink border-${alignColor(a)} font-semibold` : 'bg-panel border-hairline text-paper/60'}">${alignLabel(a)}</button>
+            <button type="button" ${isBaseRole ? 'disabled' : `onclick="selectAlign('${a}')"`} data-align="${a}" class="align-btn btn-press py-3 rounded-xl border ${r.alignment===a ? `bg-${alignColor(a)} text-ink border-${alignColor(a)} font-semibold` : 'bg-panel border-hairline text-paper/60'} ${isBaseRole ? 'disabled:opacity-60' : ''}">${alignLabel(a)}</button>
           `).join('')}
         </div>
       </div>
@@ -653,67 +645,50 @@ function renderRoleEditor(root) {
         <p class="text-[11px] text-paper/30 mt-1">0 = no night action</p>
       </div>
 
+      ${isBaseRole && r.alignment === 'mafia' ? `
+      <div>
+        <label class="text-xs case-stamp text-gold/70">MAFIA TEAM SIZE</label>
+        <input id="f_teamsize" type="number" min="1" value="${r.teamSize}" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold">
+        <p class="text-[11px] text-paper/30 mt-1">Total players on the Mafia team, including any Mafia-aligned special roles below. Everyone else starts as Town.</p>
+      </div>
+      ` : isBaseRole ? `
+      <div class="bg-panel border border-hairline rounded-xl px-4 py-3 text-sm text-paper/60">
+        Every Town player who isn't rolled into a special role becomes this role. No count to set — it simply fills what's left.
+      </div>
+      ` : `
       <div class="grid grid-cols-2 gap-3">
         <div>
-          <label class="text-xs case-stamp text-gold/70">GUARANTEED MIN.</label>
-          <input id="f_min" type="number" min="0" value="${r.minCount}" oninput="updateWeightLockState()" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold">
+          <label class="text-xs case-stamp text-gold/70">NUMBER</label>
+          <input id="f_max_num" type="number" min="1" value="${r.maxCount}" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold">
+          <p class="text-[11px] text-paper/30 mt-1">Max in the game</p>
         </div>
         <div>
-          <label class="text-xs case-stamp text-gold/70">MAX COUNT</label>
-          <input id="f_max_num" type="number" min="1" value="${unlimited ? (r.isPair?2:1) : r.maxCount}" ${unlimited ? 'disabled' : ''} oninput="updateWeightLockState()" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-3 text-paper focus:outline-none focus:border-gold disabled:opacity-40">
-          <label class="flex items-center gap-2 text-xs text-paper/50 mt-1.5">
-            <input id="f_max_unlimited" type="checkbox" ${unlimited ? 'checked' : ''} onchange="document.getElementById('f_max_num').disabled=this.checked; updateWeightLockState();">
-            Unlimited
-          </label>
+          <label class="text-xs case-stamp text-gold/70">PROBABILITY</label>
+          <div class="flex items-center gap-2 mt-1">
+            <input id="f_weight_num" type="number" min="0" max="100" value="${r.probability}" class="w-full bg-panel border border-hairline rounded-xl px-3 py-3 text-paper focus:outline-none focus:border-gold" oninput="document.getElementById('f_weight').value=Math.min(100,Math.max(0,this.value||0))">
+            <span class="text-paper/40 text-sm">%</span>
+          </div>
+          <p class="text-[11px] text-paper/30 mt-1">Chance per eligible player</p>
         </div>
       </div>
-      <p class="text-[11px] text-paper/30 -mt-2">Max caps how many players can hold this role. Villager &amp; Mafia default to unlimited. If Min equals Max, the role is fully guaranteed.</p>
-
-      <div>
-        <div class="flex justify-between items-center">
-          <label class="text-xs case-stamp text-gold/70">WEIGHTED PROBABILITY (0–100)</label>
-        </div>
-        <div class="flex items-center gap-3 mt-2">
-          <input id="f_weight" type="range" min="0" max="100" step="1" value="${r.weight}" class="flex-1" oninput="document.getElementById('f_weight_num').value=this.value">
-          <input id="f_weight_num" type="number" min="0" max="100" value="${r.weight}" class="w-16 bg-panel2 border border-hairline rounded-lg px-2 py-2 text-center font-mono text-sm focus:outline-none focus:border-gold" oninput="document.getElementById('f_weight').value=Math.min(100,Math.max(0,this.value||0))">
-        </div>
-        <p id="weightLockNote" class="text-[11px] text-gold/60 mt-1 hidden">This role is Guaranteed (Min = Max), so probability is ignored — remaining slots are shared among your other roles.</p>
-        <p id="weightHelpNote" class="text-[11px] text-paper/30 mt-1">Higher = more likely to fill remaining open slots, relative to your other roles' values.</p>
-      </div>
+      <input id="f_weight" type="range" min="0" max="100" step="1" value="${r.probability}" class="w-full -mt-2" oninput="document.getElementById('f_weight_num').value=this.value">
+      <p class="text-[11px] text-paper/30 -mt-2">Just like Among Us role settings: each eligible player independently rolls against this Probability, until Number is reached.</p>
+      `}
 
       <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
         <div>
           <div class="font-medium text-sm">Pair Role</div>
           <div class="text-paper/40 text-xs">Must always be assigned in twos (e.g. Lovers, Twins)</div>
         </div>
-        <input id="f_pair" type="checkbox" class="w-5 h-5" ${r.isPair ? 'checked' : ''}>
+        <input id="f_pair" type="checkbox" class="w-5 h-5" ${r.isPair ? 'checked' : ''} ${isBaseRole ? 'disabled' : ''}>
       </label>
     </div>
     <div class="px-5 py-4 border-t border-hairline sticky bottom-0 bg-ink/95 backdrop-blur flex gap-2">
-      ${!isNew ? `<button onclick="deleteRole('${r.id}')" class="btn-press px-5 py-3 rounded-xl bg-mafiaDim border border-mafia text-mafia font-medium">Delete</button>` : ''}
+      ${!isNew && !isBaseRole ? `<button onclick="deleteRole('${r.id}')" class="btn-press px-5 py-3 rounded-xl bg-mafiaDim border border-mafia text-mafia font-medium">Delete</button>` : ''}
       <button onclick="saveRole(${isNew ? 'null' : `'${r.id}'`})" class="btn-press flex-1 py-3 rounded-xl bg-gold text-ink font-semibold">Save Role</button>
     </div>
   `;
   window.__editAlign = r.alignment;
-  updateWeightLockState();
-}
-function updateWeightLockState() {
-  const minEl = document.getElementById('f_min');
-  const maxEl = document.getElementById('f_max_num');
-  const unlimitedEl = document.getElementById('f_max_unlimited');
-  if (!minEl || !maxEl || !unlimitedEl) return;
-  const min = parseInt(minEl.value) || 0;
-  const maxUnlimited = unlimitedEl.checked;
-  const max = maxUnlimited ? null : (parseInt(maxEl.value) || 0);
-  const locked = !maxUnlimited && max === min;
-  const weightSlider = document.getElementById('f_weight');
-  const weightNum = document.getElementById('f_weight_num');
-  const lockNote = document.getElementById('weightLockNote');
-  const helpNote = document.getElementById('weightHelpNote');
-  if (weightSlider) { weightSlider.disabled = locked; weightSlider.parentElement.classList.toggle('opacity-30', locked); }
-  if (weightNum) weightNum.disabled = locked;
-  if (lockNote) lockNote.classList.toggle('hidden', !locked);
-  if (helpNote) helpNote.classList.toggle('hidden', locked);
 }
 function selectAlign(a) {
   window.__editAlign = a;
@@ -728,22 +703,27 @@ function selectAlign(a) {
 function saveRole(id) {
   const name = $('#f_name').value.trim();
   if (!name) { errorModal('Missing name', 'Every role needs a name.'); return; }
-  const isPair = $('#f_pair').checked;
-  const maxUnlimited = $('#f_max_unlimited').checked;
-  let minCount = parseInt($('#f_min').value) || 0;
-  if (isPair && minCount % 2 !== 0) minCount += 1;
-  let maxCount = maxUnlimited ? null : Math.max(1, parseInt($('#f_max_num').value) || 1);
-  if (maxCount != null && isPair && maxCount % 2 !== 0) maxCount += 1;
-  if (maxCount != null && minCount > maxCount) maxCount = minCount;
+  const existing = id ? roleById(id) : null;
+  const isBaseRole = !!(existing && existing.isBase);
 
   const payload = {
     name,
-    alignment: window.__editAlign || 'town',
+    alignment: isBaseRole ? existing.alignment : (window.__editAlign || 'town'),
     description: $('#f_desc').value.trim(),
     wakeOrder: parseInt($('#f_wake').value) || 0,
-    minCount, maxCount, isPair,
-    weight: Math.max(0, Math.min(100, parseInt($('#f_weight_num').value) || 0)),
+    isPair: isBaseRole ? false : $('#f_pair').checked,
+    isBase: isBaseRole,
   };
+
+  if (isBaseRole && payload.alignment === 'mafia') {
+    payload.teamSize = Math.max(1, parseInt($('#f_teamsize').value) || 1);
+  } else if (!isBaseRole) {
+    let maxCount = Math.max(1, parseInt($('#f_max_num').value) || 1);
+    if (payload.isPair && maxCount % 2 !== 0) maxCount += 1;
+    payload.maxCount = maxCount;
+    payload.probability = Math.max(0, Math.min(100, parseInt($('#f_weight_num').value) || 0));
+  }
+
   if (id) {
     Object.assign(roleById(id), payload);
   } else {
@@ -754,6 +734,8 @@ function saveRole(id) {
   goto('settings');
 }
 function deleteRole(id) {
+  const role = roleById(id);
+  if (role && role.isBase) { errorModal('Base role', "Base roles can't be deleted — they're required as fallbacks."); return; }
   showModal(`
     <h3 class="font-display text-lg uppercase mb-2 text-mafia">Delete this role?</h3>
     <p class="text-sm text-paper/60 mb-4">This can't be undone.</p>
@@ -774,106 +756,64 @@ function deleteRole(id) {
 function assignRoles(playerNames) {
   const total = playerNames.length;
   const roles = state.roles;
-  const quotas = state.settings.alignmentQuotas || {};
-  const quotaCapOf = (align) => { const q = quotas[align]; return (q && q > 0) ? q : Infinity; };
 
-  // --- Validation ---
-  const guaranteedSum = roles.reduce((s,r) => s + Math.max(0, r.minCount), 0);
-  if (guaranteedSum > total) {
-    return { error: `Guaranteed roles require ${guaranteedSum} players but only ${total} are in the game. Lower some Guaranteed Minimum Counts in Settings.` };
+  const mafiaBase = roles.find(r => r.isBase && r.alignment === 'mafia');
+  const townBase = roles.find(r => r.isBase && r.alignment === 'town');
+  if (!mafiaBase || !townBase) {
+    return { error: 'Your role list needs one base Mafia role and one base Town role (like Villager) to generate a game. Check Settings → Roles.' };
   }
-  for (const align of ['mafia','town','neutral']) {
-    const cap = quotaCapOf(align);
-    if (cap === Infinity) continue;
-    const guaranteedForAlign = roles.filter(r => r.alignment === align).reduce((s,r) => s + Math.max(0, r.minCount), 0);
-    if (guaranteedForAlign > cap) {
-      return { error: `Guaranteed ${alignLabel(align)} roles need ${guaranteedForAlign} players, but the ${alignLabel(align)} team quota is only ${cap}. Lower a Guaranteed Minimum or raise the quota.` };
-    }
-  }
-  const setQuotas = ['mafia','town','neutral'].filter(a => quotaCapOf(a) !== Infinity);
-  if (setQuotas.length > 0) {
-    const sumQ = setQuotas.reduce((s,a) => s + quotaCapOf(a), 0);
-    if (setQuotas.length === 3 && sumQ !== total) {
-      return { error: `Team quotas (Mafia ${quotas.mafia ?? 0}, Town ${quotas.town ?? 0}, Neutral ${quotas.neutral ?? 0}) add up to ${sumQ}, but there are ${total} players. Adjust the quotas so they add up exactly.` };
-    }
-    if (sumQ > total) {
-      return { error: `Team quotas add up to ${sumQ}, more than the ${total} players in the game. Lower a quota.` };
-    }
+  const mafiaTeamSize = Math.max(1, mafiaBase.teamSize || 1);
+  if (mafiaTeamSize >= total) {
+    return { error: `Mafia team size (${mafiaTeamSize}) leaves no room for any Town players out of ${total} total. Lower it on the ${mafiaBase.name} role.` };
   }
 
-  // --- Setup ---
-  const counts = {};
-  const alignCounts = { mafia:0, town:0, neutral:0 };
-  roles.forEach(r => counts[r.id] = 0);
-  let pool = [];
-  roles.forEach(r => { for (let i=0;i<r.minCount;i++) { pool.push(r.id); counts[r.id]++; alignCounts[r.alignment]++; } });
+  // Split players into a Mafia pool and a Town pool up front — mirrors Among Us's Impostor count
+  const order = shuffleArr(playerNames.map((_, i) => i));
+  const mafiaPool = order.slice(0, mafiaTeamSize);
+  const townPool = order.slice(mafiaTeamSize); // Town + Neutral special roles are drawn from here
 
-  // roomFor enforces BOTH the role's own max count AND its team's overall quota cap
-  const roomFor = (r) => (r.maxCount == null || counts[r.id] < r.maxCount) && alignCounts[r.alignment] < quotaCapOf(r.alignment);
-  let remaining = total - pool.length;
+  const resultRoleId = new Array(total).fill(null);
 
-  const weightedPick = (candidates) => {
-    const totalWeight = candidates.reduce((s,r)=>s+r.weight,0);
-    if (totalWeight <= 0) return candidates[Math.floor(Math.random()*candidates.length)];
-    let roll = Math.random() * totalWeight;
-    for (const c of candidates) { if (roll < c.weight) return c; roll -= c.weight; }
-    return candidates[candidates.length-1];
-  };
-  const place = (role, n) => { for (let i=0;i<n;i++) { pool.push(role.id); counts[role.id]++; alignCounts[role.alignment]++; } remaining -= n; };
+  // Rolls each eligible special role independently against its own Probability, up to its own Number cap,
+  // for every open slot in the given pool. Anyone left unassigned gets the pool's base/fallback role.
+  function rollSpecialRoles(alignments, poolIndices, baseRole) {
+    const specials = shuffleArr(roles.filter(r => !r.isBase && alignments.includes(r.alignment) && r.probability > 0 && r.maxCount > 0));
+    let unassigned = poolIndices.slice();
 
-  // Step 1: prioritize reaching any alignment quota that's still under target
-  ['mafia','town','neutral'].forEach(align => {
-    const cap = quotaCapOf(align);
-    if (cap === Infinity) return;
-    let guard = 0;
-    while (alignCounts[align] < cap && remaining > 0 && guard < 1000) {
-      guard++;
-      const candidates = roles.filter(r => r.alignment === align && r.weight > 0 && roomFor(r) && !(r.isPair && remaining < 2));
-      if (candidates.length === 0) break;
-      const chosen = weightedPick(candidates);
-      const add = chosen.isPair ? 2 : 1;
-      if (add > remaining) break;
-      place(chosen, add);
-    }
-  });
+    specials.forEach(role => {
+      let assignedCount = 0;
+      const slotsToTry = shuffleArr(unassigned);
+      for (const idx of slotsToTry) {
+        if (assignedCount >= role.maxCount) break;
+        if (resultRoleId[idx] !== null) continue; // already taken by a previously-rolled role this pass
 
-  // Step 2: weighted fill of any remaining open slots — roomFor still enforces quota caps here
-  while (remaining > 0) {
-    const candidates = roles.filter(r => r.weight > 0 && roomFor(r) && !(r.isPair && remaining < 2));
-    if (candidates.length === 0) break;
-    const chosen = weightedPick(candidates);
-    const add = chosen.isPair ? 2 : 1;
-    place(chosen, add);
+        if (role.isPair) {
+          if (assignedCount + 2 > role.maxCount) continue;
+          const partnerCandidates = unassigned.filter(j => j !== idx && resultRoleId[j] === null);
+          if (partnerCandidates.length === 0) continue;
+          if (Math.random() * 100 < role.probability) {
+            const partner = partnerCandidates[Math.floor(Math.random() * partnerCandidates.length)];
+            resultRoleId[idx] = role.id;
+            resultRoleId[partner] = role.id;
+            assignedCount += 2;
+          }
+        } else {
+          if (Math.random() * 100 < role.probability) {
+            resultRoleId[idx] = role.id;
+            assignedCount += 1;
+          }
+        }
+      }
+      unassigned = unassigned.filter(j => resultRoleId[j] === null);
+    });
+
+    unassigned.forEach(idx => { resultRoleId[idx] = baseRole.id; });
   }
 
-  // Fallback: pad any leftover slots with Villager (or nearest available role within caps)
-  let villager = roles.find(r => r.id === 'villager') || roles.find(r => r.alignment === 'town' && !r.isPair);
-  while (pool.length < total) {
-    let fallback = (villager && roomFor(villager)) ? villager : roles.find(r => roomFor(r) && !r.isPair);
-    if (!fallback) fallback = villager || roles[0]; // last resort — table must be filled even if this slightly exceeds a cap
-    pool.push(fallback.id);
-    counts[fallback.id] = (counts[fallback.id] || 0) + 1;
-    alignCounts[fallback.alignment] = (alignCounts[fallback.alignment] || 0) + 1;
-  }
-  pool = pool.slice(0, total);
+  rollSpecialRoles(['mafia'], mafiaPool, mafiaBase);
+  rollSpecialRoles(['town','neutral'], townPool, townBase); // Neutral roles are drawn from the Town-side pool
 
-  // Playability check: at least 1 mafia + 1 town role in the final pool (respecting quotas where possible)
-  const hasAlignment = (align) => pool.some(id => roleById(id) && roleById(id).alignment === align);
-  const forceSwapIn = (align) => {
-    const role = roles.find(r => r.alignment === align && roomFor(r)) || roles.find(r => r.alignment === align);
-    if (!role) return;
-    const idx = pool.findIndex(id => roleById(id) && roleById(id).alignment !== align && !(roleById(id).isPair));
-    if (idx === -1) return;
-    const old = roleById(pool[idx]);
-    counts[old.id]--; alignCounts[old.alignment]--;
-    pool[idx] = role.id;
-    counts[role.id] = (counts[role.id] || 0) + 1; alignCounts[role.alignment] = (alignCounts[role.alignment] || 0) + 1;
-  };
-  if (!hasAlignment('mafia')) forceSwapIn('mafia');
-  if (!hasAlignment('town')) forceSwapIn('town');
-
-  pool = shuffleArr(pool);
-  const players = playerNames.map((name, i) => ({ name, roleId: pool[i], alive:true, notes:'' }));
+  const players = playerNames.map((name, i) => ({ name, roleId: resultRoleId[i], alive:true, notes:'' }));
   return { error:null, players };
 }
 
@@ -895,6 +835,7 @@ function renderLocalSetup(root) {
   if (localNames.length !== localPlayerCount) {
     localNames = Array.from({length:localPlayerCount}, (_,i) => localNames[i] || state.playerNameMemory[i] || `Player ${i+1}`);
   }
+  const mafiaBase = state.roles.find(r => r.isBase && r.alignment === 'mafia');
   root.innerHTML = `
     ${topBar('Local Play')}
     <div class="flex-1 overflow-y-auto px-5 py-5 space-y-5 pb-28">
@@ -905,6 +846,7 @@ function renderLocalSetup(root) {
           <input id="localCountInput" type="number" min="3" max="30" step="1" value="${localPlayerCount}" class="flex-1 bg-panel border border-hairline rounded-xl px-4 py-3 text-center font-mono text-lg focus:outline-none focus:border-gold" onchange="setLocalCount(this.value)">
           <button onclick="changeLocalCount(1)" class="btn-press w-11 h-11 rounded-full bg-panel2 border border-hairline text-xl shrink-0">+</button>
         </div>
+        ${mafiaBase ? `<p class="text-[11px] text-paper/30 mt-1">Mafia team size is set to ${mafiaBase.teamSize} in Settings → ${mafiaBase.name}. <button onclick="openRoleEditor('${mafiaBase.id}')" class="text-gold underline">Edit</button></p>` : ''}
       </div>
 
       <label class="flex items-center justify-between bg-panel border border-hairline rounded-xl px-4 py-3">
@@ -1219,6 +1161,7 @@ function renderOnlineMenu(root) {
 /* --- HOST --- */
 function renderOnlineHost(root) {
   if (!session.peer) initHostPeer();
+  const joinUrl = location.origin + location.pathname + '?join=' + (session.roomCode || '');
   root.innerHTML = `
     ${topBar('Hosting', { back: "leaveOnline(); goto('onlineMenu');" })}
     <div class="flex-1 overflow-y-auto px-5 py-5 space-y-5 pb-28">
@@ -1226,6 +1169,12 @@ function renderOnlineHost(root) {
         <p class="case-stamp text-paper/40 text-xs mb-1">ROOM CODE</p>
         <p class="font-display text-5xl tracking-[0.3em] text-gold">${session.roomCode || '····'}</p>
         <p class="text-paper/30 text-xs mt-2">${session.peer && session.peer.open ? 'Connected to relay' : 'Connecting…'}</p>
+        <button onclick="showHostQR=!showHostQR; render();" class="text-gold text-xs underline mt-3">${showHostQR ? 'Hide' : 'Show'} QR Code (optional)</button>
+        ${showHostQR && session.roomCode ? `
+          <div class="mt-3 flex flex-col items-center">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(joinUrl)}" alt="QR code to join room ${session.roomCode}" class="rounded-lg border border-hairline bg-paper p-2">
+            <p class="text-paper/30 text-[11px] mt-2">Scanning jumps straight to the Join screen with the code filled in — the 4-letter code above still works too.</p>
+          </div>` : ''}
       </div>
 
       <div>
@@ -1305,6 +1254,7 @@ function leaveOnline() {
   session.roomCode = null;
   session.onlinePlayers = [];
   session.clientConn = null;
+  showHostQR = false;
 }
 
 /* --- CLIENT --- */
@@ -1314,7 +1264,7 @@ function renderOnlineClient(root) {
     <div class="flex-1 flex flex-col justify-center px-6 gap-4">
       <div>
         <label class="text-xs case-stamp text-gold/70">ROOM CODE</label>
-        <input id="joinCode" maxlength="4" placeholder="ABCD" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-4 text-center font-display text-3xl tracking-[0.3em] uppercase focus:outline-none focus:border-gold">
+        <input id="joinCode" maxlength="4" value="${prefillJoinCode || ''}" placeholder="ABCD" class="mt-1 w-full bg-panel border border-hairline rounded-xl px-4 py-4 text-center font-display text-3xl tracking-[0.3em] uppercase focus:outline-none focus:border-gold">
       </div>
       <div>
         <label class="text-xs case-stamp text-gold/70">YOUR NAME</label>
